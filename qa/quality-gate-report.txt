@@ -1,0 +1,20 @@
+== Hyperion ECS — Phase 5 Quality Gate (QA-Bench-Agent) ==
+   JDK 25.0.4 | 8 cores
+
+   spawned 1,000,000 entities in 0.55 s
+
+?? Benchmark suite (12 measurement iterations ? 40 ticks each) ??????????????????
+scenario                            entities   min ms   med ms   p95 ms   max ms    B/tick
+DSL each() [codegen marshaler]     1,000,000     6.37     6.96    12.89    12.89         0
+primitive ChunkFunction            1,000,000     5.94     6.46     7.49     7.49         0
+DSL each() + rewind capture          200,000     4.63     6.06     8.88     8.88         0
+
+   DSL each() [codegen marshaler]     median 6.96 ms -> 143.7 FPS
+   primitive ChunkFunction            median 6.46 ms -> 154.8 FPS
+   parallel dispatch speedup          3.39?  (virtual threads, 8 cores)
+
+?? Release gates ???????????????????????????????????????????????????????????????
+   [PASS] GATE 1  Fail-on-GC        : 0 heap bytes/tick in all 3 scenarios
+   [PASS] GATE 2  Throughput        : 1,000,000 entities @ >= 60 FPS (< 16.6 ms median)
+
+   VERDICT: PASS — all release gates satisfied. (exit 0)

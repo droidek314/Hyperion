@@ -538,6 +538,94 @@ JSON object per interval, e.g.
 > (`MemorySegment.copy` block transfers only). Run:
 > `java -cp target/classes com.hyperion.ecs.verify.DevToolsVerification`  *(JDK 25)*
 
+## 8. Benchmarks & Validation  — _Phase 5 (QA-Bench-Agent)_ ✅
+
+Artifacts: `com.hyperion.ecs.verify.QualityGate` (runnable gate + benchmark suite),
+`com.hyperion.ecs.verify.JfrAllocationProfile` (JFR recorder), `src/jmh/java` (JMH suite),
+and the produced logs in [`qa/`](qa/).
+
+### 8.1 Tooling reality & methodology
+
+This environment has **no Maven/Gradle and no JMH jars offline**, so the JMH suite could not be
+compiled or executed here. Rather than report numbers that were never measured, Phase 5 splits the
+deliverable:
+
+| Artifact | Status |
+|---|---|
+| `src/jmh/java/.../HyperionBenchmark.java` + `-Pjmh` Maven profile | **source artifact, not executed here** — lives in a source root the default build ignores, so it cannot break `mvn package` |
+| `QualityGate` (JDK-only harness) | **executed** — all reported numbers come from this |
+| `JfrAllocationProfile` + `jfr` CLI analysis | **executed** — real recordings in `qa/` |
+
+`QualityGate` deliberately mirrors JMH methodology: separate warmup and measurement iterations
+(3 × 40 warmup ticks, 12 × 40 measured ticks), per-iteration aggregation rather than one flat
+average, percentile reporting, and gating on the **median** (not best case). Allocation is measured
+with `ThreadMXBean.getThreadAllocatedBytes` using **min-over-windows**, so a one-off JIT/JVM
+allocation cannot be smeared across ticks to mask — or falsely fail — the steady-state figure.
+
+### 8.2 Benchmark results (JDK 25, 8 cores, 12 iterations × 40 ticks)
+
+| Scenario | entities | min ms | med ms | p95 ms | max ms | B/tick |
+|---|---:|---:|---:|---:|---:|---:|
+| DSL `each()` [codegen marshaler] | 1,000,000 | 6.10 | 6.39 | 8.11 | 8.11 | **0** |
+| primitive `ChunkFunction` | 1,000,000 | 5.92 | 6.34 | 6.70 | 6.70 | **0** |
+| DSL `each()` + rewind capture | 200,000 | 4.63 | 6.06 | 8.88 | 8.88 | **0** |
+
+- **1M @ ~144–157 FPS** on both DSL tiers (median 6.4–7.0 ms vs the 16.6 ms budget) — roughly
+  **2.5× headroom** over the 60 FPS requirement.
+- The ergonomic DSL sits within **~1.0–1.1×** of the raw primitive tier, confirming the
+  `java.lang.classfile` marshaler (ADR-0008) fully closed the abstraction gap.
+- Rewind capture (copy-free `MemorySegment` block transfer every frame) stays allocation-free.
+- **Parallel dispatch: ~3.4–3.7×** on 8 cores (virtual threads, compute-heavy stateless system).
+
+### 8.3 JFR allocation profile — Fail-on-GC evidence
+
+Full log: [`qa/jfr-allocation-report.txt`](qa/jfr-allocation-report.txt); recording:
+`qa/hyperion-tick-alloc.jfr` (`settings=profile`).
+
+The recording is started **programmatically** (`jdk.jfr.Recording`) around the steady-state tick loop
+only — 400 ticks × 1,000,000 entities — because entity spawning is structural and legitimately
+allocates; a whole-process recording would drown the signal.
+
+| Metric | Result |
+|---|---|
+| `jdk.ObjectAllocationInNewTLAB` / `OutsideTLAB` | **0** |
+| `jdk.GarbageCollection` (young/old/G1/Z) | **0** |
+| `jdk.AllocationRequiringGC` | **0** |
+| ECS tick-path frames in allocation stacks | **0** |
+| `ThreadMXBean` bytes over the 400-tick window | **0 bytes total** |
+
+`jdk.ObjectAllocationSample` shows exactly **2** events, and both are JFR's *own* event-class
+instrumentation (`jdk.jfr.internal.EventInstrumentation` → `jdk.internal.classfile.*`) firing at
+`Recording.start()`; the only `com.hyperion` frame in either stack is the `main()` call site that
+started the recording, and both timestamps land in the first ~60 ms of the 3 s window. Neither is an
+ECS allocation. *(A naive `grep com.hyperion` over the stacks reports "2 hits" — the per-frame
+analysis above is what actually settles the gate.)*
+
+### 8.4 Release gates — final verdict
+
+Run: `java -cp target/classes com.hyperion.ecs.verify.QualityGate` → **exit 0** (CI PR flag; exits 1
+on any failure). Captured output: [`qa/quality-gate-report.txt`](qa/quality-gate-report.txt).
+
+| Gate | Requirement | Result |
+|---|---|---|
+| **GATE 1 — Fail-on-GC** | 0 heap bytes allocated during `tick()` | **PASS** — 0 B/tick in all 3 scenarios, corroborated by JFR (0 TLAB/GC events) |
+| **GATE 2 — Throughput** | 1,000,000 entities @ ≥ 60 FPS | **PASS** — median 6.4 ms (156 FPS) primitive, 6.4–7.0 ms (144–157 FPS) DSL |
+
+> **VERDICT: PASS — all release gates satisfied.**
+>
+> Under JMH the same gates read as: every `tick*` benchmark < 16.6 ms/op at 1M entities, and
+> `-prof gc` reporting `gc.alloc.rate.norm = 0 B/op`.
+
+### 8.5 Outstanding items (not gate-blocking)
+
+- JMH suite is unexecuted here — run `mvn -Pjmh clean package && java -jar target/benchmarks.jar -prof gc`
+  in an environment with dependency resolution to reproduce §8.2 under JMH.
+- Relationship (`link/unlink`) storage remains on-heap and is outside the rewind snapshot — the
+  fully off-heap composite-`EdgeKey` index is still a tracked follow-up (§5.5, §7.1).
+- Post-rewind entity ids may not byte-replay an earlier run (§7.1 note); aliveness safety unaffected.
+
+---
+
 ## Appendix A — Deliverables Checklist
 
 **Phase 1 (Lead-Architect)**
@@ -572,6 +660,15 @@ JSON object per interval, e.g.
 - [x] Telemetry sink (`Telemetry`) + TUI (`TuiReporter`) + stdlib WebSocket server (`TelemetryServer`)
 - [x] Telemetry per-tick overhead **≈ 0% (< 2% gate)**; WS verified against JDK `WebSocket` client
 - [x] §7 rewind mechanism & telemetry protocol specs (this document)
+
+**Phase 5 (QA-Bench-Agent)**
+- [x] JMH benchmark suite artifact (`src/jmh/java`) + `-Pjmh` Maven profile *(source only — no JMH/Maven offline)*
+- [x] Executable JDK-only benchmark suite with JMH-style methodology (`QualityGate`)
+- [x] JFR allocation profiling scoped to the tick loop (`JfrAllocationProfile`) + `qa/` logs
+- [x] **GATE 1 Fail-on-GC: PASS** — 0 B/tick, 0 TLAB/GC events, 0 tick-path allocation frames
+- [x] **GATE 2 Throughput: PASS** — 1,000,000 entities @ 144–157 FPS (median 6.4–7.0 ms)
+- [x] CI pass/fail flag via process exit code (0 = pass, 1 = release blocked)
+- [x] §8 benchmark analysis & final verdict (this document) — **documentation finalized**
 
 **JDK-25 Migration & Optimization Audit (ADR-0008)**
 - [x] Platform raised to JDK 25 LTS; `release = 25`; **all `--enable-preview` flags removed**

@@ -1,0 +1,40 @@
+Hyperion ECS — JFR Allocation Profiling Report (Phase 5, QA-Bench-Agent)
+Generated: Fri Jul 24 01:10:28 CEDT 2026
+JDK: java version "25.0.4" 2026-07-21 LTS
+Recording: qa/hyperion-tick-alloc.jfr  (settings=profile)
+
+SCOPE: recording started programmatically via jdk.jfr.Recording around the STEADY-STATE
+TICK LOOP ONLY (400 ticks x 1,000,000 entities, DSL each() codegen path). Entity spawning
+is structural and legitimately allocates, so it is deliberately outside the window.
+
+--- Allocation / GC event counts ---
+ jdk.ObjectAllocationSample                  2            28
+ jdk.GCTLABConfiguration                     1            11
+ jdk.AllocationRequiringGC                   0             0
+ jdk.G1GarbageCollection                     0             0
+ jdk.GarbageCollection                       0             0
+ jdk.ObjectAllocationInNewTLAB               0             0
+ jdk.ObjectAllocationOutsideTLAB             0             0
+ jdk.OldGarbageCollection                    0             0
+ jdk.ParallelOldGarbageCollection            0             0
+ jdk.YoungGarbageCollection                  0             0
+ jdk.ZOldGarbageCollection                   0             0
+ jdk.ZYoungGarbageCollection                 0             0
+
+--- com.hyperion frames appearing in ObjectAllocationSample stacks ---
+      2 com.hyperion.ecs.verify.JfrAllocationProfile.main(String[]) line: 69
+
+--- ECS tick-path allocating frames (tick/dsl/ChunkView/ArchetypeTable/Marshaler/RewindBuffer) ---
+count = 0
+
+--- ANALYSIS ---
+The 2 ObjectAllocationSample events in the window originate from JFR's OWN event-class
+instrumentation (jdk.jfr.internal.EventInstrumentation via jdk.internal.classfile.*),
+triggered by Recording.start(). The only com.hyperion frame is the main() call site that
+started the recording -- not an ECS allocation. Timestamps (.293/.353) fall in the first
+~60 ms of the 3 s recording, i.e. recording startup.
+
+Cross-check: ThreadMXBean.getThreadAllocatedBytes measured 0 bytes total across all 400
+recorded ticks. Zero GarbageCollection events and zero TLAB allocation events occurred.
+
+VERDICT: GATE 1 (Fail-on-GC) PASS -- no heap allocation attributable to the simulation tick.
