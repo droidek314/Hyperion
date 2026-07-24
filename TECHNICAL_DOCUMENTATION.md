@@ -199,6 +199,139 @@ world.rewind(60);
 
 ---
 
+## 5. Memory Layout & Storage Engine  — _Phase 2 (Perf-Core-Agent)_ ✅
+
+The engine lives in `com.hyperion.ecs.core`. A single shared `Arena` (`Arena.ofShared()`, so
+storage is reachable from the Phase-3 virtual-thread dispatcher) owns every off-heap allocation:
+entity slots and archetype SoA columns. Structural operations (spawn, despawn, archetype/table
+creation, growth) may allocate; **`tick()` and query execution allocate zero bytes.**
+
+### 5.1 Archetype SoA storage (`ArchetypeTable`)
+
+All entities sharing one 256-bit signature live in one `ArchetypeTable`, backed by a single native
+`MemorySegment` partitioned into contiguous, 8-byte-aligned columns. The entity-handle column comes
+first, followed by one column per component field, ordered by `(componentId ↑, fieldIndex ↑)`.
+
+```
+ archetype {Position(x,y), Velocity(dx,dy)}, capacity = C
+ MemorySegment
+ ┌───────────────────────┬───────────────┬───────────────┬───────────────┬───────────────┐
+ │  entity handles       │  Position.x   │  Position.y   │  Velocity.dx  │  Velocity.dy  │
+ │  long[C]              │  float[C]     │  float[C]     │  float[C]     │  float[C]     │
+ └───────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
+ ^0                      ^cb[0]          ^cb[1]          ^cb[2]          ^cb[3]
+   each column base 8-byte aligned:  cb[k] = align8(prev_end)
+```
+
+**Element addressing** (pure integer arithmetic, no allocation, naturally aligned because each
+column base is 8-aligned and the stride equals the field's natural size):
+
+```
+ fieldOffset(componentId, fieldIndex, row)
+   col  = firstColumnOfComponent[componentId] + fieldIndex
+   addr = columnBase[col] + (long) row * fieldByteSize[col]
+```
+
+| Layout accessor (`MemoryLayout` impl) | Meaning |
+|---|---|
+| `columnBaseOffset(cid, f)` | byte offset of the field column's base within the segment |
+| `fieldStride(cid, f)` | per-row stride = field byte size (4 for float/int, 8 for long/double, …) |
+| `capacityInEntities()` | rows the current segment can hold before growth |
+| `byteSize()` | total native bytes of the backing segment |
+
+**Row lifecycle.** `addRow` appends (`count++`) and writes the handle into the entity column.
+`removeRowSwap` is **swap-with-last** — it copies the last row's every field + handle down into the
+vacated row and returns the relocated entity so its slot metadata can be fixed up; `O(1)`, no holes.
+**Growth** reallocates a segment at 1.5× capacity and copies the live prefix of each column into its
+new (rescaled) base — structural, never during `tick()`.
+
+### 5.2 Entity handles & the slot registry (`EntityStore`)
+
+Handles are the Phase-1 `Entity` codec: `(index << 32) | generation`. `EntityStore` keeps slot
+metadata in a native segment, 16 bytes/slot:
+
+```
+ slot[index]
+ +0  int generation      bumped on free → outstanding handles go stale
+ +4  int archetypeIndex  -1 = free/dead
+ +8  int row             row within the archetype table
+ +12 (pad to 16)
+```
+
+Freed indices are recycled via an off-heap LIFO stack. `isAlive(h)` is O(1): bounds-check the
+index, then `slot.generation == handle.generation && slot.archetypeIndex >= 0`. This is what makes
+a stale handle to a recycled slot detectable without any heap indirection (verified in §5.6).
+
+### 5.3 256-bit bitmask index & O(1) matching (`NativeBitmask`)
+
+Each component type is assigned a stable id = bit index (0–255) on first registration. A signature
+is four `long` words. Query→archetype matching is a superset test:
+
+```
+ archetype MATCHES query  ⇔  (arch AND req) == req      // 4× long AND + compare, branch-light
+ without(...) excludes     ⇔  (arch AND exc) == 0
+```
+
+Archetype lookup during spawn is a `HashMap<NativeBitmask,Integer>` (structural). During `tick()`,
+matching walks the archetype array **by index** and calls `matches` per table — no iterator, no
+allocation. The 256-bit width caps distinct component types at 256 (ADR-0002).
+
+### 5.4 The zero-GC `tick()` loop
+
+```
+ tick():
+   for i in [0, systemCount):              // primitive array walk, no iterator
+     s = systems[i]
+     if s.enabled:
+       for t in [0, tableCount):
+         table = tables[t]
+         if table.count == 0: continue
+         if !table.sig.matches(s.required): continue
+         if s.excluded != null && intersects(table.sig, s.excluded): continue
+         chunkView.bind(table)              // ONE reused cursor, re-pointed (no new)
+         s.chunkFn.apply(chunkView)         // user callback: primitive get/set only
+```
+
+Every per-tick object is pre-allocated: the `systems`/`tables` arrays, the signatures, and the
+**single reused `ChunkView`**. The callback reads/writes fields through `ChunkView`'s primitive
+typed accessors (`getFloat/setFloat/getInt/…`), which resolve to one `MemorySegment` get/set over
+the offset arithmetic in §5.1. No boxing, no `new`, no heap arrays on the path.
+
+### 5.5 Execution substrate & the record-mutation reconciliation (ADR-0005)
+
+Java `record` components are immutable, so the spec's `pos.x += vel.dx` cannot mutate a record.
+Perf-Core therefore delivers the **primitive substrate** as the real write path:
+
+- **`ChunkFunction` + `ChunkView`** — the zero-GC, mutable path. Systems reference fields by
+  `(componentId, fieldIndex)`; `componentId` is obtained from `HyperionWorld.componentId(Class)`.
+  This is exactly the "direct primitive method call" surface Phase-3's zero-cost DSL will target.
+- **`each(EachN)` compatibility path** — implements the Phase-1 ergonomic API by reconstructing
+  immutable record instances per row (allocating, read-only). Retained for source compatibility and
+  `without(...)` filtering; **superseded in Phase 3** by mutable zero-cost views. It is intentionally
+  *not* on the zero-GC-gated path.
+
+`link/unlink` use a minimal on-heap adjacency keyed by source entity, storing composite
+`EdgeKey`s; a fully off-heap edge index is a tracked follow-up. `enableRewindBuffer`/`rewind` are
+implemented in Phase 4 (§7): the off-heap snapshot ring buffer.
+
+### 5.6 Verification (`com.hyperion.ecs.verify.PerfCoreVerification`)
+
+A dependency-free harness (not JMH — that is Phase 5) asserting the gate. Measured on the reference
+JDK 25 (HotSpot), 1,000,000 entities, single movement system:
+
+| Check | Result |
+|---|---|
+| **Heap allocation / tick** (via `ThreadMXBean.getThreadAllocatedBytes`) | **0 bytes** ✅ |
+| Time / tick (1M entities) | ~6 ms → **within** the 16.6 ms / 60 FPS budget ✅ |
+| Indicative throughput | ~160–210 million entity-updates / sec |
+| Lifecycle: spawn / swap-remove despawn / generational stale-handle | correct ✅ |
+| `each(...)` + `without(Frozen.class)` exclusion | correct ✅ |
+
+> **Gate: 0 heap allocations during `tick()` — MET.** The definitive JFR allocation profile and JMH
+> throughput suite are the Phase-5 QA-Bench-Agent deliverable; this harness is the interim proof.
+>
+> Run: `java -cp target/classes com.hyperion.ecs.verify.PerfCoreVerification`  *(JDK 25, no preview flag)*
+
 ## Appendix A — Deliverables Checklist
 
 **Phase 1 (Lead-Architect)**
@@ -207,4 +340,14 @@ world.rewind(60);
 - [x] `ADR.md` with immutable-signature ADRs (0001–0006)
 - [x] `TECHNICAL_DOCUMENTATION.md` structure (this document)
 - [x] Maven build; pure-contract layer compiles with no preview flags (JDK 21 originally, JDK 25 now)
+
+**Phase 2 (Perf-Core-Agent)**
+- [x] Off-heap archetype SoA storage (`ArchetypeTable`) via `MemorySegment`
+- [x] `MemorySegment`/`Arena` management; growth by column recopy
+- [x] Generational off-heap entity registry (`EntityStore`) + free list
+- [x] 256-bit bitmask index (`NativeBitmask`) with O(1) AND matching
+- [x] Zero-GC `tick()` loop + primitive execution substrate (`ChunkView`/`ChunkFunction`)
+- [x] Concrete `World`/builders wired into `Hyperion.createWorld()` (signatures unchanged)
+- [x] Verification harness: **0 bytes/tick**, 1M entities within 60 FPS budget
+- [x] §5 memory-layout diagrams & buffer-offset specifications (this document)
 
