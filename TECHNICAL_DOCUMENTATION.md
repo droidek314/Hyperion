@@ -464,6 +464,80 @@ Measured (compute-heavy system, 500k entities, 8 cores): single-thread ~1.5 s vs
 
 > Run: `java -cp target/classes com.hyperion.ecs.verify.DxVerification`  *(JDK 25, no preview flag)*
 
+## 7. Rewind Mechanism & Telemetry  — _Phase 4 (DevTools-Agent)_ ✅
+
+New code: `com.hyperion.ecs.core.OffHeapRewindBuffer` + `TickListener`, and package
+`com.hyperion.ecs.devtools` (`Telemetry`, `TuiReporter`, `TelemetryServer`).
+
+### 7.1 Off-heap snapshot ring buffer (`OffHeapRewindBuffer`)
+
+`world.enableRewindBuffer(depth)` (or `WorldConfig.rewindFrames > 0`) attaches a ring of `depth`
+off-heap frame segments, drawn from a dedicated `Arena`. When enabled, `world.tick()` calls
+`capture()` after running systems; `world.rewind(framesAgo)` calls `restore(framesAgo)`.
+
+**Copy-free capture (Requirement #5).** A frame is a direct native block copy of the live world
+state — no per-entity serialization, no boxing. Frame segment layout:
+
+```
+ [ header 32B : magic | tableCount | es.highWater | es.freeTop | es.liveCount ]
+ [ int rowCount[tableCount] ]
+ [ entity-store live bytes : slots(highWater×16) + freeStack(freeTop×4) ]
+ [ table0 live rows ][ table1 live rows ] …     // each table = [entity prefix][col0 prefix][col1 prefix]…
+```
+
+`capture()` writes the header/counts with a few scalar `set`s and block-copies each region via
+`MemorySegment.copy` (`EntityStore.captureInto`, `ArchetypeTable.captureInto`). Frame segments are
+**grow-only** and reused around the ring, so after warmup capture performs **0 heap allocations** —
+verified at 200k entities (movement + capture = **0 bytes/tick**). Total work is `O(N)` contiguous
+native writes.
+
+**Restore semantics.** `restore(framesAgo)` copies each region back into the *current* column bases
+(layout-correct even if a table grew since capture, since tables only ever grow), sets each table's
+row count, and empties any archetype created after the target frame. Because the entity-store slots
+(including generation counters) and the free list are reverted:
+
+- despawned entities **reappear** and their old handles become live again (generation reverted);
+- entities spawned after the target frame **disappear**;
+- component data is byte-identical to the captured frame.
+
+`framesAgo ∈ [1, retainedFrames]`; `framesAgo = 1` is the most recent captured frame.
+
+> **Note / trade-off.** Rewind reverts *live* state faithfully; slots that were newly allocated after
+> the target frame keep their (now-unreferenced) generation until reused, so entity ids created
+> *after* a rewind may not byte-replay an earlier run. Aliveness safety is unaffected. A fully
+> off-heap composite-`EdgeKey` relationship index is still the tracked follow-up (relationships are
+> currently on-heap and outside the snapshot).
+
+### 7.2 Telemetry (`Telemetry` / `TuiReporter` / `TelemetryServer`)
+
+`Telemetry implements TickListener`; attach with `world.setTickListener(telemetry)`. The per-tick
+hook (`onTick`) does two `System.nanoTime()` reads and a handful of `volatile` field writes — no
+allocation. Exposed sample: frame, entities, archetypes, last/avg tick ms (EMA), FPS, and rewind
+ring occupancy. Serialized off-thread via `toJson()`.
+
+- **`TuiReporter`** — renders a one-line console dashboard:
+  `HYPERION | frame 1200 | ent 1,000,000 | arch 1 | tick 6.71ms (avg 6.68) | 149.7 FPS | rewind 120/120`.
+- **`TelemetryServer`** — a **standard-library-only** WebSocket server: hand-rolled RFC 6455 upgrade
+  (`MessageDigest` SHA-1 + `Base64`) and unmasked text-frame push, connections on virtual threads.
+  Pushes `Telemetry.toJson()` on an interval. No external libraries (ASM/Netty/etc.).
+
+**Protocol.** Client connects `ws://host:port/`; server completes the 101 upgrade and streams one
+JSON object per interval, e.g.
+`{"frame":5,"entities":10,"archetypes":1,"tickMs":0.014,"avgTickMs":0.15,"fps":6645.6,"rewind":{"retained":4,"capacity":4}}`.
+
+### 7.3 Overhead gate & verification (`com.hyperion.ecs.verify.DevToolsVerification`)
+
+| Check | Result |
+|---|---|
+| Rewind: data revert / resume / despawn-resurrection / archetype-empty / count | correct ✅ |
+| Snapshot capture alloc/tick (200k entities, rewind on) | **0 bytes** ✅ |
+| **Telemetry per-tick overhead** (min-of-rounds, 200k entities) | **≈ 0% (< 2% gate)** ✅ |
+| WebSocket: stdlib server → JDK `java.net.http.WebSocket` client round-trip | valid JSON ✅ |
+
+> **Gate: < 2% telemetry overhead — MET** (measured within noise of 0%). **Copy-Free Snapshots — MET**
+> (`MemorySegment.copy` block transfers only). Run:
+> `java -cp target/classes com.hyperion.ecs.verify.DevToolsVerification`  *(JDK 25)*
+
 ## Appendix A — Deliverables Checklist
 
 **Phase 1 (Lead-Architect)**
@@ -489,6 +563,15 @@ Measured (compute-heavy system, 500k entities, 8 cores): single-thread ~1.5 s vs
 - [x] Graph relationship syntax (`Relations`) + `World.related(...)`
 - [x] Virtual-thread concurrency (`VirtualThreadDispatcher`), ~3–4× speedup verified
 - [x] §6 DSL usage guidelines & zero-cost-abstraction details (this document)
+
+**Phase 4 (DevTools-Agent)**
+- [x] Off-heap snapshot ring buffer (`OffHeapRewindBuffer`); copy-free `MemorySegment` block transfers
+- [x] `World.enableRewindBuffer/rewind` wired; capture on `tick()`, layout-correct restore
+- [x] Rewind reverts data / entity counts / despawns (generation) / post-frame archetypes — verified
+- [x] Snapshot capture **0 heap bytes/tick** (200k entities) — Zero-GC preserved
+- [x] Telemetry sink (`Telemetry`) + TUI (`TuiReporter`) + stdlib WebSocket server (`TelemetryServer`)
+- [x] Telemetry per-tick overhead **≈ 0% (< 2% gate)**; WS verified against JDK `WebSocket` client
+- [x] §7 rewind mechanism & telemetry protocol specs (this document)
 
 **JDK-25 Migration & Optimization Audit (ADR-0008)**
 - [x] Platform raised to JDK 25 LTS; `release = 25`; **all `--enable-preview` flags removed**
