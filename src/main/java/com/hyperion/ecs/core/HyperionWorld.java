@@ -218,6 +218,49 @@ public final class HyperionWorld implements World, AutoCloseable {
         return tableCount;
     }
 
+    /**
+     * Writes a single {@code int} component field for one entity, addressed by handle. Random-access
+     * companion to the chunk-oriented hot path — intended for tooling and gameplay events (e.g. the
+     * Phase-6 demo recolouring graph-linked entities), not for per-frame bulk updates.
+     *
+     * @param entity     the entity handle; ignored if dead
+     * @param type       the component type
+     * @param fieldIndex the field index within that component
+     * @param value      the value to store
+     */
+    public void setComponentInt(long entity, Class<? extends Component> type, int fieldIndex, int value) {
+        if (!entityStore.isAlive(entity)) {
+            return;
+        }
+        int slot = Entity.index(entity);
+        ArchetypeTable table = tables[entityStore.archetypeIndex(slot)];
+        int cid = registry.idOf(type);
+        if (!table.contains(cid)) {
+            return;
+        }
+        table.segment().set(java.lang.foreign.ValueLayout.JAVA_INT,
+                table.fieldOffset(cid, fieldIndex, entityStore.row(slot)), value);
+    }
+
+    /**
+     * Reads a single {@code float} component field for one entity, addressed by handle.
+     *
+     * @return the field value, or {@code 0f} if the entity is dead or lacks the component
+     */
+    public float getComponentFloat(long entity, Class<? extends Component> type, int fieldIndex) {
+        if (!entityStore.isAlive(entity)) {
+            return 0f;
+        }
+        int slot = Entity.index(entity);
+        ArchetypeTable table = tables[entityStore.archetypeIndex(slot)];
+        int cid = registry.idOf(type);
+        if (!table.contains(cid)) {
+            return 0f;
+        }
+        return table.segment().get(java.lang.foreign.ValueLayout.JAVA_FLOAT,
+                table.fieldOffset(cid, fieldIndex, entityStore.row(slot)));
+    }
+
     // ── Dispatcher seams (package-private) ───────────────────────────────────────────────
 
     int tableCount() {

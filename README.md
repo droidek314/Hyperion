@@ -53,6 +53,34 @@ world.rewind(60);   // restore the state from 60 captured frames ago
 Components that systems write to must be classes with public primitive fields. Records work as
 read-only components.
 
+## Live demo
+
+A browser dashboard that streams a 50,000-entity bouncing-particle simulation from the engine in
+real time. Build as above, then from the repository root:
+
+```bash
+java -cp target/classes com.hyperion.ecs.demo.VisualDemoApp
+```
+
+Open <http://localhost:8080>. Run it from the repository root, because the server loads
+`src/main/resources/dashboard.html` from there. Entity count and port are optional arguments, for
+example `VisualDemoApp 200000 9090`. Stop it with Ctrl+C.
+
+| Key | Button | Action |
+|---|---|---|
+| Space | Pause / Resume | Pause or resume the simulation |
+| S | Step Forward | Advance exactly one tick |
+| R | Rewind 1s | Rewind 60 frames |
+| Shift+R | Rewind 2s | Rewind 120 frames |
+| L | Graph Link | Link a hunter to 48 targets with a `Targeting` relationship and highlight them |
+
+The overlay shows the entity count, render FPS, tick duration, heap allocated per tick (it stays at
+0 B), JVM heap use, the frame number and how full the rewind buffer is.
+
+The simulation thread only runs `world.tick()`. Each frame is encoded and sent on a virtual thread
+as a binary WebSocket message: a 32-byte header plus 5 bytes per entity (250,032 bytes at 50,000
+entities). The HTTP and WebSocket server is written with the standard library only.
+
 ## Verify
 
 Each harness prints its checks and stops with an error on the first failure.
@@ -61,6 +89,7 @@ Each harness prints its checks and stops with an error on the first failure.
 java -cp target/classes com.hyperion.ecs.verify.PerfCoreVerification   # storage, lifecycle, zero-GC tick
 java -cp target/classes com.hyperion.ecs.verify.DxVerification         # DSL, relationships, parallel dispatch
 java -cp target/classes com.hyperion.ecs.verify.DevToolsVerification   # rewind, telemetry, WebSocket
+java -cp target/classes com.hyperion.ecs.verify.DemoVerification       # live demo: server, frames, controls
 java -cp target/classes com.hyperion.ecs.verify.QualityGate            # benchmarks; exits 1 if a gate fails
 ```
 
@@ -97,4 +126,5 @@ at 6.0 ms on a fresh heap, but at 24.0 ms once their iteration order no longer m
 | `com.hyperion.ecs.core` | Engine: archetype tables, entity store, tick loop, rewind ring, dispatcher |
 | `com.hyperion.ecs.dsl` | `Systems` DSL, bytecode-generated marshaler, `Relations` |
 | `com.hyperion.ecs.devtools` | Telemetry, console reporter, WebSocket server |
+| `com.hyperion.ecs.demo` | Live demo app and its HTTP / WebSocket dashboard server |
 | `com.hyperion.ecs.verify` | Verification harnesses and the quality gate |

@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperion ECS — Live Dashboard</title>
+<style>
+  :root {
+    --bg: #07090f; --panel: #0e1220; --line: #1e2740; --fg: #e6ecff;
+    --dim: #7f8db3; --ok: #39ff14; --warn: #ff9e00; --accent: #4cc9f0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  h1 { font-size: 15px; margin: 0; letter-spacing: .14em; text-transform: uppercase; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); font-size: 12px; }
+  #status { margin-left: auto; font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+         background: var(--warn); vertical-align: middle; }
+  .dot.live { background: var(--ok); }
+  main { flex: 1; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+  .stage { position: relative; width: 100%; border: 1px solid var(--line); border-radius: 6px;
+           overflow: hidden; background: #05070c; }
+  canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+  #hud {
+    position: absolute; top: 10px; left: 12px; padding: 10px 14px; border-radius: 5px;
+    background: rgba(7,9,15,.82); border: 1px solid var(--line);
+    display: grid; grid-template-columns: auto auto; gap: 2px 16px; pointer-events: none;
+  }
+  #hud .k { color: var(--dim); }
+  #hud .v { text-align: right; font-variant-numeric: tabular-nums; }
+  #hud .v.ok { color: var(--ok); }
+  #hud .v.warn { color: var(--warn); }
+  #paused {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    font-size: 34px; letter-spacing: .3em; color: rgba(255,255,255,.16);
+  }
+  #paused.on { display: flex; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+    padding: 8px 14px; border-radius: 4px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button kbd { color: var(--dim); font-size: 11px; margin-left: 6px; }
+  footer { padding: 0 18px 18px; color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hyperion <span>ECS</span></h1>
+  <span class="sub">off-heap archetype engine &middot; live canvas dashboard</span>
+  <span id="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></span>
+</header>
+
+<main>
+  <div class="stage">
+    <canvas id="view" width="1600" height="900"></canvas>
+    <div id="hud">
+      <div class="k">entities</div><div class="v" id="mEntities">—</div>
+      <div class="k">render FPS</div><div class="v" id="mFps">—</div>
+      <div class="k">tick duration</div><div class="v" id="mTick">—</div>
+      <div class="k">tick heap alloc</div><div class="v" id="mAlloc">—</div>
+      <div class="k">JVM heap used</div><div class="v" id="mHeap">—</div>
+      <div class="k">frame</div><div class="v" id="mFrame">—</div>
+      <div class="k">rewind buffer</div><div class="v" id="mRewind">—</div>
+    </div>
+    <div id="paused">PAUSED</div>
+  </div>
+
+  <div class="controls">
+    <button id="bPause">Pause / Resume<kbd>space</kbd></button>
+    <button id="bStep">Step Forward<kbd>s</kbd></button>
+    <button id="bRw1">Rewind 1s (60f)<kbd>r</kbd></button>
+    <button id="bRw2">Rewind 2s (120f)<kbd>R</kbd></button>
+    <button id="bLink">Graph Link<kbd>l</kbd></button>
+  </div>
+</main>
+
+<footer>
+  Binary frame protocol: 32-byte header + 5 bytes/entity (uint16 x, uint16 y, uint8 palette).
+  Rendering via <code>ImageData</code> direct pixel writes.
+</footer>
+
+<script>
+(() => {
+  "use strict";
+
+  const W = 1600, H = 900, HEADER = 32, STRIDE = 5;
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const img = ctx.createImageData(W, H);
+  const u32 = new Uint32Array(img.data.buffer);
+
+  // Little-endian ABGR packing for direct Uint32 pixel writes.
+  const rgb = (r, g, b) => (255 << 24) | (b << 16) | (g << 8) | r;
+  const PALETTE = [
+    rgb(76, 201, 240), rgb(72, 149, 239), rgb(67, 97, 238), rgb(114, 9, 183),
+    rgb(247, 37, 133), rgb(255, 158, 0),  rgb(255, 255, 255), rgb(57, 255, 20)
+  ];
+  const BG = rgb(5, 7, 12);
+
+  const el = id => document.getElementById(id);
+  const hud = {
+    entities: el("mEntities"), fps: el("mFps"), tick: el("mTick"),
+    alloc: el("mAlloc"), heap: el("mHeap"), frame: el("mFrame"), rewind: el("mRewind")
+  };
+
+  let latest = null;          // most recent payload (Uint8Array view)
+  let latestCount = 0;
+  let dirty = false;
+  let frames = 0, lastFpsAt = performance.now(), fps = 0;
+
+  // ── WebSocket ───────────────────────────────────────────────────────────────
+  let ws;
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      el("dot").classList.add("live");
+      el("statusText").textContent = `connected — ${location.host}`;
+    };
+    ws.onclose = () => {
+      el("dot").classList.remove("live");
+      el("statusText").textContent = "disconnected — retrying…";
+      setTimeout(connect, 1000);
+    };
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = ev => {
+      if (typeof ev.data === "string") return;
+      const buf = ev.data;
+      if (buf.byteLength < HEADER) return;
+      const dv = new DataView(buf);
+      if (dv.getUint8(0) !== 1) return;           // msgType FRAME
+
+      const paused = (dv.getUint8(1) & 1) !== 0;
+      const count = dv.getUint32(4, true);
+
+      latest = new Uint8Array(buf, HEADER);
+      latestCount = Math.min(count, (buf.byteLength - HEADER) / STRIDE | 0);
+      dirty = true;
+
+      el("paused").classList.toggle("on", paused);
+      hud.entities.textContent = count.toLocaleString();
+      hud.frame.textContent = dv.getUint32(8, true).toLocaleString();
+      hud.tick.textContent = (dv.getUint32(12, true) / 1000).toFixed(2) + " ms";
+
+      const alloc = dv.getUint32(16, true);
+      hud.alloc.textContent = alloc === 0 ? "0 B  ✓" : alloc.toLocaleString() + " B";
+      hud.alloc.className = "v " + (alloc === 0 ? "ok" : "warn");
+
+      hud.heap.textContent = (dv.getUint32(20, true) / 1024).toFixed(1) + " MB";
+      hud.rewind.textContent = dv.getUint32(24, true) + " / " + dv.getUint32(28, true) + " f";
+    };
+  }
+
+  const send = obj => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
+
+  // ── Render loop ─────────────────────────────────────────────────────────────
+  function render() {
+    if (dirty && latest) {
+      dirty = false;
+      u32.fill(BG);
+      const data = latest, n = latestCount;
+      for (let i = 0, o = 0; i < n; i++, o += STRIDE) {
+        // uint16 -> pixel, reserving a 2x2 block so particles stay visible when scaled down
+        const x = ((data[o] | (data[o + 1] << 8)) * W / 65536) | 0;
+        const y = ((data[o + 2] | (data[o + 3] << 8)) * H / 65536) | 0;
+        const px = x < W - 1 ? x : W - 2, py = y < H - 1 ? y : H - 2;
+        const c = PALETTE[data[o + 4] & 7];
+        const p = py * W + px;
+        u32[p] = c; u32[p + 1] = c; u32[p + W] = c; u32[p + W + 1] = c;
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+
+    frames++;
+    const now = performance.now();
+    if (now - lastFpsAt >= 500) {
+      fps = frames * 1000 / (now - lastFpsAt);
+      frames = 0; lastFpsAt = now;
+      hud.fps.textContent = fps.toFixed(0);
+    }
+    requestAnimationFrame(render);
+  }
+
+  // ── Controls ────────────────────────────────────────────────────────────────
+  el("bPause").onclick = () => send({ cmd: "toggle" });
+  el("bStep").onclick  = () => send({ cmd: "step" });
+  el("bRw1").onclick   = () => send({ cmd: "rewind", frames: 60 });
+  el("bRw2").onclick   = () => send({ cmd: "rewind", frames: 120 });
+  el("bLink").onclick  = () => send({ cmd: "link" });
+
+  addEventListener("keydown", e => {
+    if (e.target.tagName === "INPUT") return;
+    if (e.key === " ")      { e.preventDefault(); send({ cmd: "toggle" }); }
+    else if (e.key === "s") send({ cmd: "step" });
+    else if (e.key === "r") send({ cmd: "rewind", frames: 60 });
+    else if (e.key === "R") send({ cmd: "rewind", frames: 120 });
+    else if (e.key === "l") send({ cmd: "link" });
+  });
+
+  u32.fill(BG);
+  ctx.putImageData(img, 0, 0);
+  connect();
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>

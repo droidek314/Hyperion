@@ -80,6 +80,24 @@ public final class DevToolsVerification {
 
             world.tick();                                 // resume from rewound state -> x = 4
             check(readX(world, POS) == 4f, "simulation resumes post-rewind: x = 4 (got " + readX(world, POS) + ")");
+
+            // A rewind abandons the "future" frames. The live timeline is now x1, x2, x3, x4', x5'
+            // after one more tick, so a second rewind(3) must land on x = 3 — never on the
+            // abandoned x4/x5 frames that are still physically present in the ring.
+            world.tick();                                 // x = 5 on the new timeline
+            world.rewind(3);
+            check(readX(world, POS) == 3f,
+                    "second rewind follows the new timeline: x = 3 (got " + readX(world, POS) + ")");
+            check(world.rewindBuffer().retainedFrames() == 3,
+                    "abandoned frames dropped from history: retained = 3 (got "
+                            + world.rewindBuffer().retainedFrames() + ")");
+            boolean rejected = false;
+            try {
+                world.rewind(4);                          // older than the live timeline allows
+            } catch (IllegalArgumentException e) {
+                rejected = true;
+            }
+            check(rejected, "rewind past the truncated history is rejected");
         }
 
         // Despawn reversal + generation restore, and archetype-emptying.

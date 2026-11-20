@@ -121,14 +121,40 @@ public final class OffHeapRewindBuffer implements RewindBuffer, AutoCloseable {
         for (int t = tc; t < world.tableCount(); t++) {
             world.tableAt(t).resetCount();
         }
+
+        // Truncate the timeline. The frames newer than the restored one belong to a future that was
+        // just abandoned; leaving them in the ring would let a later rewind land on them. The
+        // restored frame becomes the newest retained frame and the next capture overwrites the
+        // first abandoned slot.
+        head = (slot + 1) % capacity;
+        retained -= framesAgo - 1;
     }
 
+    /**
+     * Returns the frame segment for {@code slot}, sized for at least {@code total} bytes.
+     *
+     * <p><b>Eager ring sizing.</b> {@code Arena.allocate} returns a {@code MemorySegment}, which is
+     * itself a heap object — so lazily growing one slot per frame would allocate on the tick path
+     * for the first {@code capacity} frames. Whenever any slot must grow, every slot is (re)sized in
+     * the same pass, so a steady-state {@link #capture()} performs <b>zero heap allocation</b>.
+     * Growth is monotonic, so this settles after the first capture at a given world size.
+     */
     private MemorySegment ensureFrame(int slot, long total) {
         MemorySegment f = frames[slot];
         if (f == null || f.byteSize() < total) {
-            // Grow-only; world storage grows monotonically, so frames stabilise after warmup.
-            f = arena.allocate(total);
-            frames[slot] = f;
+            for (int i = 0; i < frames.length; i++) {
+                MemorySegment cur = frames[i];
+                if (cur == null) {
+                    frames[i] = arena.allocate(total);
+                } else if (cur.byteSize() < total) {
+                    // Grow in place-by-copy: a slot may hold a retained frame that must survive,
+                    // otherwise restore() would read a zeroed segment and report corruption.
+                    MemorySegment bigger = arena.allocate(total);
+                    MemorySegment.copy(cur, 0, bigger, 0, cur.byteSize());
+                    frames[i] = bigger;
+                }
+            }
+            f = frames[slot];
         }
         return f;
     }
